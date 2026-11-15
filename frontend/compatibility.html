@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>SPHEREx / Aladin compatibility probe</title></head>
+<body style="margin:0;background:#080c12;color:white;font:14px sans-serif">
+  <div id="status">Initializing viewer</div>
+  <div id="probe" style="width:100vw;height:90vh"></div>
+  <script type="module">
+    import A from 'aladin-lite';
+    window.probeErrors = [];
+    try {
+      await A.init;
+      const survey = A.HiPS('https://irsa.ipac.caltech.edu/data/hips/SPHEREx/spherex_allsky_cube', {
+        successCallback: layer => {
+          // Aladin assumes a uniformly sampled frequency axis. NASA lists
+          // ascending, nonuniform wavelengths: select by verified tile index.
+          const min = 299792458 / layer.emMax;
+          const max = 299792458 / layer.emMin;
+          layer.setFrequency({ value: min + (62.5 / layer.cubeDepth) * (max - min), unit: 'Hz' });
+        },
+      });
+      window.aladin = A.aladin('#probe', {
+        survey,
+        target: '266.41683 -29.00781', fov: 360, projection: 'AIT',
+        cooFrame: 'ICRS', showCooGrid: false, showReticle: false, log: false,
+      });
+      aladin.on('click', event => { window.lastClick = event; });
+      document.querySelector('#status').textContent = 'Viewer initialized; inspect tile responses and rendered pixels';
+    } catch (error) {
+      window.probeErrors.push(String(error));
+      document.querySelector('#status').textContent = String(error);
+    }
+  </script>
+</body>
+</html>

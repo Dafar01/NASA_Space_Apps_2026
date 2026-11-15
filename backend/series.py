@@ -1,0 +1,160 @@
+"""Persistent JSON manifests and bounded preparation of real sky sequences."""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import hashlib
+import json
+import logging
+from pathlib import Path
+import re
+from typing import Callable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from backend import archive, processing
+
+LOGGER = logging.getLogger(__name__)
+PIPELINE_VERSION = 1
+
+
+class SeriesRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+    ra: float
+    dec: float = Field(ge=-90, le=90)
+    size_deg: float = Field(default=0.1, ge=0.02, le=0.2)
+    detector: Literal["D1", "D2", "D3", "D4", "D5", "D6"] = "D2"
+
+    @field_validator("ra")
+    @classmethod
+    def wrap_ra(cls, value: float) -> float:
+        return round(value % 360, 6) % 360
+
+    @field_validator("dec", "size_deg")
+    @classmethod
+    def rounded(cls, value: float) -> float:
+        return round(value, 6)
+
+
+def series_id(request: SeriesRequest) -> str:
+    return hashlib.sha256(json.dumps({**request.model_dump(), "pipeline_version": PIPELINE_VERSION}, sort_keys=True).encode()).hexdigest()[:24]
+
+
+def valid_id(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{24}", value) is not None
+
+
+def read_saved(root: Path, identity: str) -> dict | None:
+    if not valid_id(identity):
+        return None
+    directory = root / "series" / identity
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("id") != identity or manifest.get("pipeline_version") != PIPELINE_VERSION:
+            return None
+        required = {"query", "created_at", "frame_count", "frames", "date_start", "date_end", "wavelength_min_um", "wavelength_max_um"}
+        if not required.issubset(manifest) or not isinstance(manifest["frames"], list) or manifest["frame_count"] != len(manifest["frames"]):
+            return None
+        SeriesRequest.model_validate(manifest["query"])
+        for frame in manifest["frames"]:
+            filename = frame["image_file"]
+            image = directory / "frames" / filename
+            if not re.fullmatch(r"\d{3}-[0-9a-f]{12}\.png", filename) or not image.is_file():
+                return None
+            if hashlib.sha256(image.read_bytes()).hexdigest() != frame["image_sha256"]:
+                return None
+        return manifest
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def list_saved(root: Path) -> list[dict]:
+    sequences = []
+    for path in (root / "series").glob("*/manifest.json"):
+        saved = read_saved(root, path.parent.name)
+        if saved and saved["frames"]:
+            sequences.append({key: saved[key] for key in ["id", "query", "created_at", "frame_count", "date_start", "date_end", "wavelength_min_um", "wavelength_max_um"]})
+    return sorted(sequences, key=lambda s: s["created_at"], reverse=True)
+
+
+def prepare(request: SeriesRequest, root: Path, progress: Callable[[str, int, int], None] | None = None,
+            *, observations: list[dict] | None = None, local_only: bool = False, refresh: bool = False) -> dict:
+    identity = series_id(request)
+    saved = read_saved(root, identity)
+    if saved and not refresh:
+        return saved
+    directory = root / "series" / identity
+    update = progress or (lambda message, completed, total: None)
+    update("Searching NASA IRSA for dated observations…", 0, 0)
+    if local_only and observations is None:
+        raise ValueError("Local-only preparation requires a supplied observation catalog")
+    rows = archive.search(request.ra, request.dec, request.detector) if observations is None else observations
+    # Deduplicate processing versions of the same exposure, retaining DR1 first.
+    unique: dict[str, dict] = {}
+    for row in sorted(rows, key=lambda r: (r["release"] == "DR1", r["uri"])):
+        exposure = Path(row["uri"]).name.split("_spx_")[0]
+        unique[exposure] = row
+    rows = sorted(unique.values(), key=lambda r: (r["mjd"], r["uri"]))
+    archive.atomic_json(directory / "query.json", {"query": request.model_dump(), "queried_at": datetime.now(timezone.utc).isoformat(), "endpoint": archive.TAP, "observations": rows})
+    candidates = processing.evenly_sample(rows, processing.MAX_CANDIDATES)
+    target, shape = processing.output_grid(request.ra, request.dec, request.size_deg)
+    frames: list[processing.Frame] = []
+    rejected: list[dict] = []
+
+    def process(row: dict) -> processing.Frame:
+        url = archive.cutout_url(row["uri"], request.ra, request.dec, request.size_deg)
+        if local_only:
+            path = root / "cutouts" / f"{hashlib.sha256(url.encode()).hexdigest()[:24]}.fits"
+            if not path.is_file():
+                raise FileNotFoundError(f"Cutout is not saved locally: {row['uri']}")
+        else:
+            path = archive.download_cutout(url, root)
+        return processing.read_frame(path, {**row, "source_url": url}, request.ra, request.dec, target, shape)
+
+    update("Downloading and checking dated FITS cutouts…", 0, len(candidates))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        tasks = {pool.submit(process, row): row for row in candidates}
+        for completed, future in enumerate(as_completed(tasks), 1):
+            row = tasks[future]
+            try:
+                frames.append(future.result())
+            except Exception as error:
+                LOGGER.warning("Cutout excluded: %s: %s", row["uri"], error)
+                rejected.append({"uri": row["uri"], "reason": str(error)})
+            update("Downloading and checking dated FITS cutouts…", completed, len(candidates))
+    # Do not publish an empty permanent cache for an upstream outage or a failed
+    # processing implementation: the next online request must be able to retry.
+    if candidates and not frames:
+        detail = rejected[0]["reason"] if rejected else "No usable cutouts"
+        raise RuntimeError(f"No usable cutouts could be prepared. {detail}")
+    selected = processing.compatible_frames(frames)
+    update("Aligning the sequence and saving previews locally…", len(candidates), len(candidates))
+    display = processing.save_previews(selected, directory / "frames")
+    for frame in selected:
+        frame.metadata["image_url"] = f"/api/series/{identity}/frames/{frame.metadata['image_file']}"
+    dates = [frame.metadata["timestamp"] for frame in selected]
+    waves = [frame.metadata["wavelength_um"] for frame in selected]
+    notes = ["Wavelengths are matched at the selected coordinate (total spread ≤2%); they can vary across each patch.",
+             "Fixed sky coordinates and one shared brightness stretch. Teal pixels are masked or lack coverage.",
+             "Visual exploration only: PSF, background, and residual calibration differences can mimic changes."]
+    if len(rows) >= 1000:
+        notes.append("The archive search is capped at 1,000 rows; this sequence is a bounded sample, not a complete archive search.")
+    if len(candidates) < len(rows):
+        notes.append(f"Sampled {len(candidates)} of {len(rows)} matching exposures across the available date range.")
+    if rejected:
+        notes.append(f"{len(rejected)} cutouts were excluded because of download, metadata, or image-quality problems.")
+    if len(selected) < 2:
+        notes.append("Fewer than two compatible frames are available. Try another detector or position; chronological playback is unavailable.")
+    manifest = {"id": identity, "pipeline_version": PIPELINE_VERSION, "state": "ready" if selected else "empty",
+                "query": request.model_dump(), "created_at": datetime.now(timezone.utc).isoformat(),
+                "source": "NASA IRSA SPHEREx DR1 / QR3 individual spectral images", "frame_count": len(selected),
+                "date_start": dates[0] if dates else None, "date_end": dates[-1] if dates else None,
+                "wavelength_min_um": min(waves) if waves else None, "wavelength_max_um": max(waves) if waves else None,
+                "matched_exposures": len(rows), "sampled_exposures": len(candidates), "usable_cutouts": len(frames),
+                "frames": [frame.metadata for frame in selected], "excluded": rejected, "notes": notes, "display": display,
+                "wcs": dict(target.to_header()), "image_shape": list(shape),
+                "timestamp_definition": "UTC, from IRSA time_bounds_lower (MJD exposure start)",
+                "mask_policy": "Mask nonfinite values, nonpositive variance, and all flag bits except SOURCE and FULLSAMPLE."}
+    # This file is the commit point: it is published only after all PNGs exist.
+    archive.atomic_json(directory / "manifest.json", manifest)
+    return manifest
