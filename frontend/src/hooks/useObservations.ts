@@ -44,6 +44,7 @@ export function useObservations() {
     if (!selection || !ready) return;
     const controller = new AbortController();
     const signal = controller.signal;
+    const deadline = Date.now() + 8 * 60 * 1000;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const base: Resource = { key: selection.key, series: null, progress: null, error: '' };
     setResource({ ...base, progress: { id: '', state: 'preparing', query: selection.query,
@@ -54,6 +55,7 @@ export function useObservations() {
     }
     async function receive(response: SeriesResponse) {
       if (signal.aborted) return;
+      if (Date.now() > deadline) throw new Error('IRSA preparation is taking longer than expected. It may continue saving in the backend. Retry to reconnect, or open a saved object.');
       if (response.state === 'error') throw new Error(response.message);
       if (response.state === 'preparing') {
         setResource({ ...base, progress: response });

@@ -136,6 +136,68 @@ test('compiled app on a fresh offline backend needs no external requests or brow
   await expect(slider).toHaveValue('1'); expect(external).toEqual([]);
 });
 
+test('rebuilt previews expose available pixels and reserve checkerboard for genuinely absent data', async ({ page }) => {
+  const sequence = sequences.find(sequence => Math.abs(sequence.query.ra - 83.82208) < .000002 && sequence.frames[0]?.available_fraction != null);
+  test.skip(!sequence, 'Requires a locally rebuilt Orion sequence.');
+  const frame = sequence!.frames[0];
+  const external: string[] = []; await blockExternal(page, external);
+  await page.goto(OFFLINE_URL);
+  await page.getByRole('tab', { name: 'Observation playback', exact: true }).click();
+  await page.locator('.saved-object-toggle').filter({ hasText: targetName(sequence!.query.ra, sequence!.query.dec) }).click();
+  const image = page.locator('.observation-image');
+  await expect(image).toHaveAttribute('src', frame.image_url);
+  const details = page.getByRole('region', { name: 'Observation details', exact: true });
+  await expect(details).toContainText('Available pixels');
+  await expect(details).toContainText(`${(frame.available_fraction! * 100).toFixed(1)}%`);
+  await expect(details).toContainText('Quality-checked pixels');
+  const pixels = await image.evaluate(async (element: HTMLImageElement) => {
+    await element.decode();
+    const canvas = document.createElement('canvas'); canvas.width = element.naturalWidth; canvas.height = element.naturalHeight;
+    const context = canvas.getContext('2d')!; context.drawImage(element, 0, 0);
+    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let available = 0, missing = 0, unexpected = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index], g = data[index + 1], b = data[index + 2];
+      if (r === g && g === b) available++;
+      else if ((r === 38 && g === 49 && b === 61) || (r === 58 && g === 70 && b === 82)) missing++;
+      else unexpected++;
+    }
+    return { available, missing, unexpected, total: canvas.width * canvas.height };
+  });
+  expect(pixels.available).toBe(Math.round(frame.available_fraction! * pixels.total));
+  expect(pixels.missing).toBe(pixels.total - pixels.available);
+  expect(pixels.unexpected).toBe(0);
+  expect(frame.available_fraction!).toBeGreaterThan(frame.valid_fraction);
+  await page.screenshot({ path: 'artifacts/atlas-orion-restored-desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: 'artifacts/atlas-orion-restored-mobile.png', fullPage: true });
+  expect(external).toEqual([]);
+});
+
+test('the previously failing sky coordinates open real SIA-discovered frames and scrub offline', async ({ page }) => {
+  const sequence = sequences.find(sequence => sequence.query.ra === 258.661698 && sequence.query.dec === 14.390973 && sequence.query.detector === 'D2');
+  test.skip(!sequence || sequence.frame_count < 2, 'Requires the live SIA regression sequence.');
+  const external: string[] = []; await blockExternal(page, external);
+  await page.goto(OFFLINE_URL);
+  await page.getByLabel('Right ascension in degrees').fill('258.661698');
+  await page.getByLabel('Declination in degrees').fill('14.390973');
+  await page.getByRole('button', { name: 'Go to location', exact: true }).click();
+  await page.getByRole('button', { name: 'View observations', exact: true }).click();
+  const slider = page.getByRole('slider', { name: 'Observation timeline' });
+  await expect(slider).toBeEnabled();
+  await expect(page.locator('.observation-image')).toHaveAttribute('src', sequence!.frames[0].image_url);
+  await expect(page.getByTestId('observation-date')).toHaveText(`${observationDate(sequence!.frames[0].timestamp, true)} UTC`);
+  await slider.focus(); await slider.press('End');
+  await expect(slider).toHaveValue(String(sequence!.frame_count - 1));
+  await expect(page.locator('.observation-image')).toHaveAttribute('src', sequence!.frames.at(-1)!.image_url);
+  await page.getByRole('button', { name: 'Next observation', exact: true }).click();
+  await expect(slider).toHaveValue('0');
+  await expect(page.locator('.error-banner')).toHaveCount(0);
+  await page.screenshot({ path: 'artifacts/atlas-sia-playback.png', fullPage: true });
+  expect(external).toEqual([]);
+});
+
 test('a failed observation-service connection is visible and retry resumes the selected preset', async ({ page }) => {
   test.skip(!saved, 'Requires a real cached Barnard’s Star sequence.');
   let calls = 0;

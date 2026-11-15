@@ -1,0 +1,63 @@
+import { expect, test } from '@playwright/test';
+import { OFFLINE_URL } from '../servers';
+
+test('logo stays for three seconds, fades to the landing page, and returns only on reload', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.clock.install({ time: new Date('2026-11-15T10:00:00Z') });
+  await page.clock.pauseAt(new Date('2026-11-15T10:00:01Z'));
+  await page.goto(OFFLINE_URL);
+  const splash = page.getByRole('status', { name: 'Loading Atlas', exact: true });
+  const app = page.locator('.app');
+  await expect(splash).toBeVisible();
+  await expect(splash.getByRole('img', { name: 'Atlas — Sky Viewer', exact: true })).toHaveJSProperty('complete', true);
+  await expect(app).toHaveJSProperty('inert', true);
+  await expect(app).toHaveAttribute('aria-hidden', 'true');
+  // The sky starts behind the splash instead of waiting for it to finish.
+  await expect(page.locator('.viewer-shell')).toHaveCount(1);
+  await page.keyboard.press('Tab');
+  expect(await page.evaluate(() => Boolean(document.activeElement?.closest('.app')))).toBeFalsy();
+  await page.screenshot({ path: 'artifacts/atlas-splash-desktop.png', fullPage: true });
+  await page.clock.runFor(2999);
+  await expect(splash).not.toHaveClass(/is-leaving/);
+  await page.clock.runFor(1);
+  await expect(splash).toHaveClass(/is-leaving/);
+  await expect(splash).toHaveCSS('transition-property', 'opacity');
+  await page.clock.runFor(599);
+  await expect(splash).toHaveCount(1);
+  await expect(app).toHaveJSProperty('inert', true);
+  await page.clock.runFor(1);
+  await expect(splash).toHaveCount(0);
+  await expect(app).toHaveJSProperty('inert', false);
+  await expect(app).not.toHaveAttribute('aria-hidden');
+  await expect(page.getByRole('tab', { name: 'Sky view', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('tab', { name: 'Observation playback', exact: true }).click();
+  await page.getByRole('tab', { name: 'Sky view', exact: true }).click();
+  await expect(splash).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await expect(splash).toBeVisible();
+  await expect(splash.getByRole('img')).toHaveJSProperty('complete', true);
+  const logo = (await splash.locator('.splash-logo').boundingBox())!;
+  expect(logo.width).toBeGreaterThan(200); expect(logo.height).toBeGreaterThan(100);
+  await page.screenshot({ path: 'artifacts/atlas-splash-mobile.png', fullPage: true });
+  const bounds = (await splash.boundingBox())!;
+  expect(bounds.width).toBe(390); expect(bounds.height).toBe(844);
+  await page.clock.runFor(3600);
+  await expect(splash).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test('reduced motion keeps the three-second hold and skips the fade', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.clock.install({ time: new Date('2026-11-15T10:00:00Z') });
+  await page.clock.pauseAt(new Date('2026-11-15T10:00:01Z'));
+  await page.goto(OFFLINE_URL);
+  const splash = page.getByRole('status', { name: 'Loading Atlas', exact: true });
+  await expect(splash).toBeVisible();
+  await page.clock.runFor(2999);
+  await expect(splash).toHaveCount(1);
+  await page.clock.runFor(1);
+  await expect(splash).toHaveCount(0);
+  await expect(page.locator('.app')).toHaveJSProperty('inert', false);
+});

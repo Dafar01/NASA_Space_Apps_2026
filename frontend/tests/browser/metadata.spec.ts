@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 
 const catalog = { candidates: [], radius_arcsec: 30, total_matches: 0, source: 'SIMBAD test transport', retrieved_at: '2026-11-14T00:00:00Z', cached: false, search_limited: false };
-const response = { source: 'NASA IRSA TAP', observations: [{ observation_id: 'level2_metadata_only_2D2', detector: 'D2', release: 'DR1', timestamp: '2026-09-01T00:00:00Z', wavelength_um: null, bandwidth_um: null, valid_fraction: null, center_ra: null, center_dec: null, size_deg: null }], limited: false, cached: false };
+const response = { source: 'NASA IRSA SIA', observations: [{ observation_id: 'level2_metadata_only_2D2', detector: 'D2', release: 'DR1', timestamp: '2026-09-01T00:00:00Z', wavelength_um: null, bandwidth_um: null, valid_fraction: null, center_ra: null, center_dec: null, size_deg: null }], limited: false, cached: false };
 async function select(page: Page, ra: string) {
   await page.getByLabel('Right ascension in degrees').fill(ra);
   await page.getByLabel('Declination in degrees').fill('-20');
@@ -31,6 +31,7 @@ test('metadata retries independently, shows unknown pixel fields honestly, and n
   await expect(metadata.getByText('Image analysis required', { exact: true })).toHaveCount(3);
   await expect(metadata).toContainText('Detector coverage: 1.10–1.62 µm');
   await expect(metadata).toContainText('No observation images were downloaded');
+  await expect(metadata).toContainText('NASA IRSA SIA');
   expect(images).toEqual([]); expect(preparations).toEqual([]);
   expect(calls).toBe(2);
 });

@@ -10,7 +10,7 @@ interface Record extends FrameMetadata {
   timestamp: string; detector: string; center_ra: number | null; center_dec: number | null; size_deg: number | null;
 }
 interface Lookup {
-  source: 'saved_cutouts' | 'NASA IRSA TAP'; observations: Record[]; limited: boolean;
+  source: 'saved_cutouts' | 'NASA IRSA SIA' | 'NASA IRSA TAP'; observations: Record[]; limited: boolean;
   retrieved_at: string; cached: boolean; message?: string; cache_warning?: string | null;
 }
 export function SkyObservationInfo({ position, offline }: { position: SkyPosition; offline: boolean }) {
@@ -40,10 +40,10 @@ export function SkyObservationInfo({ position, offline }: { position: SkyPositio
     {data && !record && <p className="field-hint">{data.message || 'No spectral observations returned at this position.'}</p>}
     {record && <><label className="object-match-label">{data!.source === 'saved_cutouts' ? 'Saved field observations' : 'Archive observations'}<select aria-label="Observation record" value={selected} onChange={event => setSelected(Number(event.target.value))}>{data!.observations.map((record, index) => <option key={`${record.observation_id}:${record.release}`} value={index}>{observationDate(record.timestamp)} · {record.detector} · {record.release}</option>)}</select></label>
       <ObservationDetails frame={record} />
-      {data!.source === 'saved_cutouts' ? <p className="field-hint">Saved cutout centered at {record.center_ra?.toFixed(6)}°, {record.center_dec?.toFixed(6)}°{record.size_deg !== null ? ` · ${(record.size_deg * 60).toFixed(1)}′ field` : ''}. Wavelength is measured at that center; valid pixels describes the field.</p> : <p className="field-hint">Detector coverage: {BANDS.find(band => band.id === record.detector)?.range} µm. Exact wavelength, bandwidth, and valid pixels require image analysis. No observation images were downloaded.</p>}
+      {data!.source === 'saved_cutouts' ? <p className="field-hint">Saved cutout centered at {record.center_ra?.toFixed(6)}°, {record.center_dec?.toFixed(6)}°{record.size_deg !== null ? ` · ${(record.size_deg * 60).toFixed(1)}′ field` : ''}. Wavelength is measured at that center. Pixel percentages describe availability and quality across the field.</p> : <p className="field-hint">Detector coverage: {BANDS.find(band => band.id === record.detector)?.range} µm. Exact wavelength, bandwidth, and pixel quality require image analysis. No observation images were downloaded.</p>}
     </>}
     {data?.limited && <p className="field-hint">Showing a limited sample of up to 24 observations.</p>}
-    {data && <p className="field-hint">{data.source === 'saved_cutouts' ? 'Local observation metadata' : 'NASA IRSA TAP'}{data.cached ? ' · saved locally' : ''}</p>}
+    {data && <p className="field-hint">{data.source === 'saved_cutouts' ? 'Local observation metadata' : data.source}{data.cached ? ' · saved locally' : ''}</p>}
     {data?.cache_warning && <p className="field-error">{data.cache_warning}</p>}
   </section>;
 }

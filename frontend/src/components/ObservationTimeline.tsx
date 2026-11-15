@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertCircle, ArrowDownToLine, ArrowUpRight, ChevronDown, ChevronLeft, ChevronRight, Film, LoaderCircle, Pause, Play, RefreshCw, Waves } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, ChevronDown, ChevronLeft, ChevronRight, Film, LoaderCircle, Pause, Play, RefreshCw, Waves } from 'lucide-react';
 import type { Observations } from '../hooks/useObservations';
 import { groupSavedObjects, samePosition, wavelengthLabel } from '../config/bands';
 import { targetName } from '../config/targets';
@@ -21,12 +21,20 @@ export function ObservationTimeline({ observations: obs, active, onOpenSaved, on
   const [imagesReady, setImagesReady] = useState(false);
   const [imageError, setImageError] = useState('');
   const [imageAttempt, setImageAttempt] = useState(0);
+  const [waitingSeconds, setWaitingSeconds] = useState(0);
   const count = series?.frames.length ?? 0;
   const safeIndex = Math.min(index, Math.max(0, count - 1));
   const frame = series?.frames[safeIndex];
 
   useEffect(() => { if (selectedKey) setExpanded(selectedKey); }, [selectedKey]);
   useEffect(() => { if (!active) setPlaying(false); }, [active]);
+  useEffect(() => {
+    setWaitingSeconds(0);
+    if (!progress) return;
+    const started = Date.now();
+    const timer = setInterval(() => setWaitingSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [selection?.key, Boolean(progress)]);
   useEffect(() => {
     setIndex(0); setPlaying(false); setImagesReady(false); setImageError('');
     if (!series?.frames.length) return;
@@ -39,9 +47,10 @@ export function ObservationTimeline({ observations: obs, active, onOpenSaved, on
         image.src = frame.image_url;
       }) };
     });
+    const timeout = setTimeout(() => { if (!disposed) { disposed = true; setImageError('Observation images took too long to load. Check the backend connection and retry the images.'); } }, 30000);
     void Promise.all(images.map(item => item.promise)).then(() => { if (!disposed) setImagesReady(true); })
-      .catch(error => { if (!disposed) setImageError(error.message); });
-    return () => { disposed = true; images.forEach(({ image }) => { image.onload = null; image.onerror = null; }); };
+      .catch(error => { if (!disposed) setImageError(error.message); }).finally(() => clearTimeout(timeout));
+    return () => { disposed = true; clearTimeout(timeout); images.forEach(({ image }) => { image.onload = null; image.onerror = null; }); };
   }, [series, imageAttempt]);
   useEffect(() => {
     if (!active || !playing || !imagesReady || count < 2) return;
@@ -54,10 +63,10 @@ export function ObservationTimeline({ observations: obs, active, onOpenSaved, on
     <section className="timeline-panel" aria-label="Chronological observations">
       <div className="playback-heading"><div><span className="eyebrow">OBSERVATION PLAYBACK</span><h2>{selection ? targetName(selection.query.ra, selection.query.dec) : 'Watch the sky change.'}</h2></div></div>
       {(error || imageError) && <div className="error-banner" role="alert"><AlertCircle size={17} /><span>{error || imageError}</span><button className="text-button" onClick={() => error ? obs.retry() : setImageAttempt(value => value + 1)}>Retry</button></div>}
-      {frame && <section className="observation-details" aria-label="Observation details"><h3>Observation details</h3><ObservationDetails frame={frame} /><details className="provenance-details"><summary>Source and processing notes<ChevronDown size={14} /></summary>{series?.notes.map(note => <p key={note} className="field-hint">{note}</p>)}<a href={`/api/series/${series!.id}/manifest`} target="_blank" rel="noreferrer" className="object-source"><ArrowDownToLine size={13} />View sequence metadata</a></details></section>}
+      {frame && <section className="observation-details" aria-label="Observation details"><ObservationDetails frame={frame} /></section>}
       <div className="observation-stage">
         {frame ? <><img key={frame.image_url} src={frame.image_url} alt={`SPHEREx observation of ${targetName(series!.query.ra, series!.query.dec)} on ${observationDate(frame.timestamp)}`} className="observation-image" /><span className="image-compass">N ↑<br />E ←</span><div className="frame-caption"><div><span className="eyebrow">OBSERVED ON</span><strong data-testid="observation-date">{observationDate(frame.timestamp, true)} UTC</strong></div><span className="frame-badge">{safeIndex + 1}<span> / {count}</span></span></div></> : <div className="player-empty">
-          {progress ? <><LoaderCircle size={30} className="spin" /><h3>Preparing your view</h3><p role="status">{progress.message}</p>{progress.total > 0 && <progress value={progress.completed} max={progress.total} />}</> : <><Film size={36} strokeWidth={1} /><h3>{series?.state === 'empty' ? 'No observations here yet' : 'Every frame tells a story'}</h3><p>{series?.message || 'Choose an object from your collection, or explore a location in the sky view.'}</p><button className="button button-primary" onClick={onSky}>Explore the sky<ArrowUpRight size={15} /></button></>}
+          {progress ? <><LoaderCircle size={30} className="spin" /><h3>Preparing your view</h3><p role="status">{progress.message}</p><span className="loading-elapsed">{waitingSeconds}s elapsed{progress.total > 0 ? ` · ${progress.completed} / ${progress.total} cutouts checked` : ''}</span>{progress.total > 0 && <progress value={progress.completed} max={progress.total} />}{waitingSeconds >= 15 && <p className="loading-explanation">New locations require real FITS cutouts from NASA IRSA. Saved objects open directly from this computer.</p>}<button className="button button-secondary" onClick={() => { obs.cancel(); onSky(); }}>Back to sky</button></> : <><Film size={36} strokeWidth={1} /><h3>{series?.state === 'empty' ? 'No observations here yet' : error ? 'Observations could not be loaded' : 'Every frame tells a story'}</h3><p>{series?.message || (error ? 'Retry the request above, open a saved object, or choose another sky position.' : 'Choose an object from your collection, or explore a location in the sky view.')}</p><button className="button button-primary" onClick={onSky}>Explore the sky<ArrowUpRight size={15} /></button></>}
         </div>}
       </div>
       <div className="timeline-player">
@@ -65,7 +74,7 @@ export function ObservationTimeline({ observations: obs, active, onOpenSaved, on
         <div className="scrubber"><input type="range" aria-label="Observation timeline" min={0} max={Math.max(0, count - 1)} value={safeIndex} disabled={!imagesReady || count < 2} onChange={event => { setPlaying(false); setIndex(Number(event.target.value)); }} /><div className="timeline-endpoints"><span>{series?.date_start ? observationDate(series.date_start) : 'Earlier'}</span><span>{series?.date_end ? observationDate(series.date_end) : 'Later'}</span></div></div>
         <label className="speed-control"><span className="sr-only">Playback speed</span><select aria-label="Playback speed" value={speed} onChange={event => setSpeed(event.target.value)}><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
       </div>
-      <div className="playback-note"><span>{count ? `${count} observations${imagesReady ? '' : ' · loading previews'}` : 'Chronological sequence'}</span><span>Time gaps vary · no interpolated frames</span></div>
+      <div className="playback-note"><span>{count ? `${count} observations${imagesReady ? '' : ' · loading previews'}` : 'Chronological sequence'}</span>{frame?.available_fraction != null && <span className="pixel-legend"><i aria-hidden="true" />Checkerboard = unavailable pixels</span>}<span>Time gaps vary · no interpolated frames</span></div>
     </section>
     <aside className="saved-library" aria-label="Saved observations"><div className="collection-heading"><div><span className="eyebrow">YOUR COLLECTION</span><h3>Saved objects <span>{groups.length}</span></h3></div><button className="icon-button" aria-label="Refresh saved observations" onClick={() => void obs.refresh()}><RefreshCw size={16} /></button></div><p className="field-hint">Choose an object, then explore its infrared wavelengths.</p>
       {obs.libraryError && <p className="field-error" role="alert">{obs.libraryError}</p>}

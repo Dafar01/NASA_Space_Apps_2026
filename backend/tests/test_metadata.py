@@ -20,7 +20,8 @@ def observation(**changes):
 
 
 def votable_response(rows):
-    table = Table(rows=rows, names=["uri", "time_bounds_lower", "energy_bandpassname"])
+    rows = [(f'https://irsa.ipac.caltech.edu/{uri}', mjd, band) for uri, mjd, band in rows]
+    table = Table(rows=rows, names=["access_url", "t_min", "energy_bandpassname"])
     output = io.BytesIO()
     table.write(output, format="votable")
     response = requests.Response()
@@ -39,7 +40,7 @@ class MetadataTests(unittest.TestCase):
             frame = observation(wavelength_um=1.576, bandwidth_um=.038, valid_fraction=.637).model_dump(mode="json")
             path.write_text(json.dumps({"id": "a" * 24, "pipeline_version": 1,
                 "query": {"ra": 359.99, "dec": 0, "detector": "D2", "size_deg": .1}, "frames": [frame]}))
-            with patch("backend.metadata.requests.get", side_effect=AssertionError("Do not contact IRSA")), \
+            with patch("backend.discovery.requests.get", side_effect=AssertionError("Do not contact IRSA")), \
                     patch("backend.archive.download_cutout", side_effect=AssertionError("Never download images")):
                 result = metadata.lookup(.01, 0, root)
                 self.assertEqual(result["source"], "saved_cutouts")
@@ -52,8 +53,8 @@ class MetadataTests(unittest.TestCase):
 
     def test_archive_query_is_small_metadata_only_and_keeps_pixel_fields_unknown(self):
         row = ("ibe/data/spherex/dr1/level2/test/level2_test_2D2_spx_version.fits", 61000., "SPHEREx-D2")
-        with patch("backend.metadata.requests.get", return_value=votable_response([row, row])) as get:
-            observations, limited = metadata.query_archive(10., -20.)
+        with patch("backend.discovery.requests.get", return_value=votable_response([row, row])) as get:
+            observations, limited, source = metadata.query_archive(10., -20.)
             self.assertEqual(len(observations), 1)
             self.assertFalse(limited)
             item = observations[0]
@@ -63,14 +64,15 @@ class MetadataTests(unittest.TestCase):
             self.assertIsNone(item.bandwidth_um)
             self.assertIsNone(item.valid_fraction)
             args, options = get.call_args
-            self.assertEqual(args, (metadata.TAP,))
-            self.assertIn("TOP 25", options["params"]["QUERY"])
-            self.assertEqual(options["timeout"], (5, 15))
+            self.assertEqual(source, 'NASA IRSA SIA')
+            self.assertEqual(args, ('https://irsa.ipac.caltech.edu/SIA',))
+            self.assertIn(('POS', 'CIRCLE 10.0 -20.0 0'), options['params'])
+            self.assertLessEqual(sum(options['timeout']), 12)
 
     def test_live_metadata_and_empty_results_are_cached_and_reused_offline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("backend.metadata.query_archive", return_value=([observation()], False)) as query:
+            with patch("backend.metadata.query_archive", return_value=([observation()], False, 'NASA IRSA SIA')) as query:
                 first = metadata.lookup(370, -20, root)
                 self.assertFalse(first["cached"])
                 self.assertEqual(query.call_count, 1)
@@ -78,7 +80,7 @@ class MetadataTests(unittest.TestCase):
                 saved = metadata.lookup(10, -20, root, offline=True)
                 self.assertTrue(saved["cached"])
                 self.assertIsNone(saved["observations"][0]["wavelength_um"])
-            with patch("backend.metadata.query_archive", return_value=([], False)):
+            with patch("backend.metadata.query_archive", return_value=([], False, 'NASA IRSA SIA')):
                 metadata.lookup(11, -20, root)
             with patch("backend.metadata.query_archive", side_effect=AssertionError("Reuse empty results")):
                 self.assertEqual(metadata.lookup(11, -20, root)["observations"], [])
@@ -88,25 +90,25 @@ class MetadataTests(unittest.TestCase):
         response.status_code = 503
         response._content = b"down"
         response._content_consumed = True
-        with patch("backend.metadata.requests.get", return_value=response):
+        with patch("backend.discovery.requests.get", return_value=response), patch('backend.discovery.time.sleep'):
             with self.assertRaises(metadata.MetadataUnavailable):
                 metadata.query_archive(1, 2)
         response = requests.Response()
         response.status_code = 200
         response._content = b'<VOTABLE><RESOURCE><INFO name="QUERY_STATUS" value="OVERFLOW" /></RESOURCE></VOTABLE>'
         response._content_consumed = True
-        with tempfile.TemporaryDirectory() as directory, patch("backend.metadata.requests.get", return_value=response):
+        with tempfile.TemporaryDirectory() as directory, patch("backend.discovery.requests.get", return_value=response):
             with self.assertRaises(metadata.MetadataUnavailable):
                 metadata.lookup(1, 2, Path(directory))
             self.assertFalse(list(Path(directory).rglob("*.json")))
 
     def test_result_limit_and_cache_write_failure_are_explicit(self):
         rows = [(f"ibe/data/spherex/dr1/level2/test/level2_{index}_2D2_spx_version.fits", 61000. - index, "SPHEREx-D2") for index in range(25)]
-        with patch("backend.metadata.requests.get", return_value=votable_response(rows)):
-            items, limited = metadata.query_archive(1, 2)
+        with patch("backend.discovery.requests.get", return_value=votable_response(rows)):
+            items, limited, _source = metadata.query_archive(1, 2)
             self.assertTrue(limited)
             self.assertEqual(len(items), 24)
-        with tempfile.TemporaryDirectory() as directory, patch("backend.metadata.query_archive", return_value=([observation()], False)), \
+        with tempfile.TemporaryDirectory() as directory, patch("backend.metadata.query_archive", return_value=([observation()], False, 'NASA IRSA SIA')), \
                 patch("backend.metadata.atomic_json", side_effect=PermissionError("locked")):
             result = metadata.lookup(1, 2, Path(directory))
             self.assertEqual(len(result["observations"]), 1)

@@ -101,7 +101,7 @@ def create_app(cache_root: Path | None = None, offline: bool | None = None) -> F
 
         def work():
             try:
-                manifest = prepare(request, cache, progress)
+                manifest = prepare(request, cache, progress, interactive=True)
                 with lock:
                     jobs[identity] = {**manifest, "cached": False, "offline": False,
                                       "message": "Sequence saved locally and ready for offline playback."}

@@ -32,6 +32,7 @@ declare module 'aladin-lite' {
     setFoVRange(min: number, max: number): void;
     setProjection(projection: 'AIT'): void;
     setRotation(rotation: number): void;
+    setBackgroundColor(color: string): void;
     setCooGrid(options: { enabled?: boolean; color?: string; opacity?: number; labelSize?: number }): void;
     pix2world(x: number, y: number, frame?: 'ICRS'): [number, number] | undefined;
     world2pix(ra: number, dec: number, frame?: 'ICRS'): [number, number] | undefined;

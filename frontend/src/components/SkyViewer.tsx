@@ -215,12 +215,14 @@ export const SkyViewer = forwardRef<SkyViewerHandle, SkyViewerProps>(function Sk
           showZoomControl: false, showLayersControl: false, showFullscreenControl: false,
           showFrame: false, showFov: false, showCooLocation: false, showProjectionControl: false,
           showStatusBar: false, showReticle: false, showCooGrid: false,
-          backgroundColor: '#080d14', log: false, inertia: false,
+          backgroundColor: '#121C30', log: false, inertia: false,
         });
         viewerRef.current = viewer;
+        // The initial option can run before Aladin's WASM listener is attached.
+        viewer.setBackgroundColor('#121C30');
         guardProjectionConversion(viewer);
         viewer.setFoVRange(0.1, 360);
-        const catalog = A.catalog({ name: 'Selected ICRS position', color: '#e5ad82', sourceSize: 22, shape: 'cross' });
+        const catalog = A.catalog({ name: 'Selected ICRS position', color: '#D6A24B', sourceSize: 22, shape: 'cross' });
         viewer.addCatalog(catalog);
         catalogRef.current = catalog;
         sourceFactory.current = A.source;

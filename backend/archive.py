@@ -1,4 +1,4 @@
-"""IRSA TAP discovery and original FITS cutouts, cached on disk."""
+"""IRSA discovery adapters and original FITS cutouts, cached on disk."""
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import time
+from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlencode, urlparse
 import uuid
 import xml.etree.ElementTree as ET
@@ -18,6 +19,9 @@ import requests
 IRSA = "https://irsa.ipac.caltech.edu"
 TAP = f"{IRSA}/TAP/sync"
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
+
+if TYPE_CHECKING:
+    from backend.discovery import DiscoveryResult
 
 
 def replace_with_retry(source: Path, destination: Path, attempts: int = 6) -> None:
@@ -50,13 +54,13 @@ def atomic_json(path: Path, value: dict | list) -> None:
             logging.getLogger(__name__).warning("Temporary file remains locked: %s", temporary)
 
 
-def fetch(url: str, *, params: dict | None = None) -> requests.Response:
+def fetch(url: str, *, params: dict | None = None, timeout: tuple[float, float] = (15, 120), attempts: int = 3) -> requests.Response:
     """Finite retries; TLS verification remains enabled."""
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         response = None
         try:
-            response = requests.get(url, params=params, timeout=(15, 120), stream=True)
+            response = requests.get(url, params=params, timeout=timeout, stream=True)
             response.raise_for_status()
             return response
         except requests.RequestException as error:
@@ -65,38 +69,16 @@ def fetch(url: str, *, params: dict | None = None) -> requests.Response:
             last_error = error
             if isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code < 500 and error.response.status_code != 429:
                 break
-            if attempt < 2:
+            if attempt + 1 < attempts:
                 time.sleep(1 + attempt)
     raise RuntimeError(f"IRSA request failed: {last_error}") from last_error
 
 
-def search(ra: float, dec: float, detector: str) -> list[dict]:
-    # User input is validated before interpolation. No arbitrary ADQL is accepted.
-    if detector not in {f"D{i}" for i in range(1, 7)}:
-        raise ValueError("Unknown SPHEREx detector")
-    query = f"""
-        SELECT TOP 1000 a.uri, p.time_bounds_lower, p.energy_bandpassname
-        FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid
-        WHERE 1 = CONTAINS(POINT('ICRS', {float(ra)}, {float(dec)}), p.poly)
-          AND p.energy_bandpassname = 'SPHEREx-{detector}'
-        ORDER BY p.time_bounds_lower
-    """
-    with fetch(TAP, params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "votable", "QUERY": query}) as response:
-        payload = response.content
-    # Parsing a VOTable also detects TAP QUERY_STATUS errors.
-    table = parse_single_table(io.BytesIO(payload)).to_table(use_names_over_ids=True)
-    rows: list[dict] = []
-    seen: set[str] = set()
-    for row in table:
-        uri = str(row["uri"])
-        if not uri.startswith(("ibe/data/spherex/dr1/level2/", "ibe/data/spherex/qr3/level2/")) or not uri.endswith(".fits"):
-            continue
-        if uri in seen:
-            continue
-        seen.add(uri)
-        rows.append({"uri": uri, "mjd": float(row["time_bounds_lower"]), "detector": detector,
-                     "release": "DR1" if "/dr1/" in uri else "QR3"})
-    return sorted(rows, key=lambda row: (row["mjd"], row["uri"]))
+def search(ra: float, dec: float, detector: str, *, progress: Callable[[str], None] | None = None) -> DiscoveryResult:
+    # Keep batch search_page separate: it enumerates the complete TAP catalog.
+    from backend.discovery import discover
+
+    return discover(ra, dec, detector, progress=progress)
 
 
 def search_page(ra: float, dec: float, detector: str, *, after: str = "", page_size: int = 500) -> tuple[list[dict], str, bool]:
@@ -156,7 +138,7 @@ def cutout_url(uri: str, ra: float, dec: float, size: float) -> str:
     return f"{url}?{urlencode({'center': f'{ra},{dec}d', 'size': size})}"
 
 
-def download_cutout(url: str, cache_root: Path) -> Path:
+def download_cutout(url: str, cache_root: Path, *, interactive: bool = False) -> Path:
     identity = hashlib.sha256(url.encode()).hexdigest()[:24]
     path = cache_root / "cutouts" / f"{identity}.fits"
     if path.exists():
@@ -164,7 +146,8 @@ def download_cutout(url: str, cache_root: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{identity}.{uuid.uuid4().hex}.part")
     try:
-        with fetch(url) as response, temporary.open("wb") as output:
+        options = {"timeout": (5, 20), "attempts": 2} if interactive else {}
+        with fetch(url, **options) as response, temporary.open("wb") as output:
             total = 0
             for chunk in response.iter_content(128 * 1024):
                 total += len(chunk)

@@ -14,6 +14,7 @@ export interface ObservationFrame {
   release: string;
   processing_version: string;
   valid_fraction: number;
+  available_fraction?: number | null;
   image_url: string;
   image_file: string;
   source_url: string;
@@ -51,14 +52,20 @@ export interface PendingSeries {
 export type SeriesResponse = ObservationSeries | PendingSeries;
 
 export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
-  const body: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    const detail = body && typeof body === 'object' && 'detail' in body ? body.detail : null;
-    throw new Error(typeof detail === 'string' ? detail : `Observation API returned HTTP ${response.status}.`);
+  const timeout = AbortSignal.timeout(25000);
+  try {
+    const response = await fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+    const body: unknown = await response.json().catch(error => { if (timeout.aborted) throw error; return null; });
+    if (!response.ok) {
+      const detail = body && typeof body === 'object' && 'detail' in body ? body.detail : null;
+      throw new Error(typeof detail === 'string' ? detail : `Observation API returned HTTP ${response.status}.`);
+    }
+    if (!body || typeof body !== 'object') throw new Error('The observation API returned an invalid response.');
+    return body as T;
+  } catch (error) {
+    if (timeout.aborted && !init?.signal?.aborted) throw new Error('The observation service did not respond within 25 seconds. Check the backend connection and retry.');
+    throw error;
   }
-  if (!body || typeof body !== 'object') throw new Error('The observation API returned an invalid response.');
-  return body as T;
 }
 
 export function observationDate(timestamp: string, includeTime = false): string {

@@ -116,6 +116,50 @@ test('real sky: pointer coordinates, anchored popup, persistent tabs, presets, c
   expect(errors).toEqual([]);
 });
 
+test('preset zoom survives playback, wavelength changes and repeated tab switches', async ({ page }) => {
+  await page.addInitScript(() => {
+    const fetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+      if (url.origin === location.origin && url.pathname === '/api/objects') return Response.json({ candidates: [], radius_arcsec: 30, total_matches: 0, source: 'SIMBAD test transport', retrieved_at: '2026-11-14T00:00:00Z', cached: false, search_limited: false });
+      if (url.origin === location.origin && url.pathname === '/api/observation-metadata') return Response.json({ observations: [], source: 'NASA IRSA SIA', limited: false, cached: false });
+      if (url.origin === location.origin && url.pathname === '/api/series' && init?.method === 'POST') return Response.json({ state: 'empty', frames: [], notes: [] });
+      return fetch(input, init);
+    };
+  });
+  await page.goto('/');
+  await expect(page.locator('.map-stage')).toHaveAttribute('data-status', 'ready', { timeout: 60000 });
+  await page.locator('.target').filter({ hasText: 'Barnard' }).click();
+  await expect(page.getByTestId('field-of-view')).toHaveText('0.50°');
+  await page.getByRole('button', { name: 'Close object information' }).click();
+  await page.getByRole('button', { name: 'Zoom in', exact: true }).click();
+  await expect.poll(() => fov(page)).toBeLessThan(.5);
+  const zoom = await page.getByTestId('field-of-view').textContent();
+  const canvas = await page.locator('.aladin-imageCanvas').elementHandle();
+  const dimensions = await canvas!.evaluate((element: HTMLCanvasElement) => ({ width: element.width, height: element.height }));
+  for (const changeBand of [false, true, false]) {
+    await page.getByRole('tab', { name: 'Observation playback', exact: true }).click();
+    await expect(page.getByRole('slider', { name: 'Observation timeline' })).toBeEnabled();
+    expect(await canvas!.evaluate((element: HTMLCanvasElement) => ({ width: element.width, height: element.height }))).toEqual(dimensions);
+    if (changeBand) {
+      const bands = page.getByRole('group', { name: /Barnard.* wavelengths/ });
+      await bands.getByRole('button').filter({ hasText: 'D1' }).click();
+      await expect(page.getByRole('slider', { name: 'Observation timeline' })).toBeEnabled();
+    }
+    await page.getByRole('tab', { name: 'Sky view', exact: true }).click();
+    await expect(page.getByTestId('field-of-view')).toHaveText(zoom!);
+    expect(await canvas!.evaluate(element => element === document.querySelector('.aladin-imageCanvas'))).toBeTruthy();
+  }
+  // Wider preset zooms are preserved too, including on the mobile layout.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.target').filter({ hasText: 'Orion Nebula' }).click();
+  await expect(page.getByTestId('field-of-view')).toHaveText('8.00°');
+  await page.getByRole('tab', { name: 'Observation playback', exact: true }).click();
+  await expect(page.getByRole('slider', { name: 'Observation timeline' })).toBeEnabled();
+  await page.getByRole('tab', { name: 'Sky view', exact: true }).click();
+  await expect(page.getByTestId('field-of-view')).toHaveText('8.00°');
+});
+
 test('a preset selected before startup completes navigates when the map becomes ready', async ({ page }) => {
   let release: () => void = () => {};
   const gate = new Promise<void>(resolve => { release = resolve; });

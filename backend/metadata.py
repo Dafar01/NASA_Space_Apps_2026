@@ -3,21 +3,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
-import io
 import json
 import logging
 import math
 from pathlib import Path
 import threading
 from typing import Literal
-import xml.etree.ElementTree as ET
 
-from astropy.io.votable import parse_single_table
 from astropy.time import Time
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
-import requests
 
-from backend.archive import TAP, atomic_json
+from backend.archive import atomic_json
+from backend.discovery import DiscoveryUnavailable, discover
 from backend.series import PIPELINE_VERSION, SeriesRequest, valid_id
 
 LIMIT = 24
@@ -37,6 +34,7 @@ class Observation(BaseModel):
     wavelength_um: float | None = Field(default=None, gt=0)
     bandwidth_um: float | None = Field(default=None, gt=0)
     valid_fraction: float | None = Field(default=None, ge=0, le=1)
+    available_fraction: float | None = Field(default=None, ge=0, le=1)
     center_ra: float | None = Field(default=None, ge=0, lt=360)
     center_dec: float | None = Field(default=None, ge=-90, le=90)
     size_deg: float | None = Field(default=None, gt=0)
@@ -47,7 +45,7 @@ class Metadata(BaseModel):
     version: Literal[1] = 1
     ra: float = Field(ge=0, lt=360)
     dec: float = Field(ge=-90, le=90)
-    source: Literal["saved_cutouts", "NASA IRSA TAP"]
+    source: Literal["saved_cutouts", "NASA IRSA SIA", "NASA IRSA TAP"]
     retrieved_at: datetime
     observations: list[Observation] = Field(max_length=LIMIT)
     limited: bool = False
@@ -89,41 +87,21 @@ def saved_observations(root: Path, ra: float, dec: float) -> tuple[list[Observat
     return items[:LIMIT], len(items) > LIMIT
 
 
-def query_archive(ra: float, dec: float) -> tuple[list[Observation], bool]:
-    query = f"""SELECT TOP {LIMIT + 1} a.uri, p.time_bounds_lower, p.energy_bandpassname
-        FROM spherex.artifact a JOIN spherex.plane p ON a.planeid = p.planeid
-        WHERE 1 = CONTAINS(POINT('ICRS', {ra}, {dec}), p.poly)
-          AND (a.uri LIKE 'ibe/data/spherex/dr1/level2/%.fits'
-               OR a.uri LIKE 'ibe/data/spherex/qr3/level2/%.fits')
-        ORDER BY p.time_bounds_lower DESC"""
+def query_archive(ra: float, dec: float) -> tuple[list[Observation], bool, str]:
     if not SLOTS.acquire(blocking=False):
         raise MetadataUnavailable("Observation metadata service is busy. Please retry.")
     try:
-        with requests.get(TAP, params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "votable",
-                          "MAXREC": LIMIT + 2, "QUERY": query}, timeout=(5, 15), stream=True) as response:
-            response.raise_for_status()
-            payload = bytearray()
-            for chunk in response.iter_content(16384):
-                payload.extend(chunk)
-                if len(payload) > 1024 * 1024:
-                    raise ValueError("Unexpectedly large metadata response")
-        for info in ET.fromstring(payload).iter():
-            if info.tag.rsplit("}", 1)[-1] == "INFO" and info.get("name", "").upper() == "QUERY_STATUS" and info.get("value", "").upper() in {"ERROR", "OVERFLOW"}:
-                raise ValueError("Incomplete IRSA metadata response")
-        table = parse_single_table(io.BytesIO(payload)).to_table(use_names_over_ids=True)
+        result = discover(ra, dec, metadata_only=True)
         records = []
-        for row in table:
+        for row in reversed(result.rows):
             uri = str(row["uri"])
-            if not uri.startswith(("ibe/data/spherex/dr1/level2/", "ibe/data/spherex/qr3/level2/")) or not uri.endswith(".fits") or ".." in uri:
-                raise ValueError("Unexpected observation product")
             records.append(Observation(observation_id=Path(uri).name.split("_spx_")[0],
-                detector=str(row["energy_bandpassname"]).removeprefix("SPHEREx-"),
-                release="DR1" if "/dr1/" in uri else "QR3",
-                timestamp=Time(float(row["time_bounds_lower"]), format="mjd", scale="utc").to_datetime(timezone=timezone.utc)))
+                detector=row["detector"], release=row["release"],
+                timestamp=Time(row["mjd"], format="mjd", scale="utc").to_datetime(timezone=timezone.utc)))
         unique = {(item.observation_id, item.release): item for item in records}
-        return list(unique.values())[:LIMIT], len(records) > LIMIT
-    except (requests.RequestException, ValueError, KeyError, TypeError, ET.ParseError) as error:
-        raise MetadataUnavailable("IRSA observation metadata is unavailable. Please retry. No images were downloaded.") from error
+        return list(unique.values())[:LIMIT], result.limited or len(unique) > LIMIT, result.source
+    except (DiscoveryUnavailable, ValueError, KeyError, TypeError) as error:
+        raise MetadataUnavailable(f"IRSA observation metadata is unavailable: {error}. No images were downloaded.") from error
     finally:
         SLOTS.release()
 
@@ -145,10 +123,10 @@ def lookup(ra: float, dec: float, root: Path, *, offline: bool = False) -> dict:
     except (OSError, ValueError):
         pass
     if offline:
-        return {**Metadata(ra=ra, dec=dec, source="NASA IRSA TAP", retrieved_at=now, observations=[]).model_dump(mode="json"),
+        return {**Metadata(ra=ra, dec=dec, source="NASA IRSA SIA", retrieved_at=now, observations=[]).model_dump(mode="json"),
                 "cached": False, "offline": True, "message": "No observation metadata saved at this position. Reconnect to look it up."}
-    observations, limited = query_archive(ra, dec)
-    result = Metadata(ra=ra, dec=dec, source="NASA IRSA TAP", retrieved_at=now, observations=observations, limited=limited).model_dump(mode="json")
+    observations, limited, source = query_archive(ra, dec)
+    result = Metadata(ra=ra, dec=dec, source=source, retrieved_at=now, observations=observations, limited=limited).model_dump(mode="json")
     warning = None
     try:
         atomic_json(path, result)
